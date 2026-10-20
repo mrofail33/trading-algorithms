@@ -1,0 +1,421 @@
+//@version=5
+indicator("Bot Signal Suite - ORB / VWAP / ICT", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=50)
+
+i_show_orb = input.bool(true, "Show ORB levels")
+i_show_vwap = input.bool(true, "Show VWAP / EMA")
+i_show_ict = input.bool(true, "Show ICT liquidity")
+i_show_fvg = input.bool(false, "Show ICT FVG boxes")
+i_show_signal_labels = input.bool(true, "Show trade signal labels")
+i_show_trade_plan = input.bool(true, "Show entry / stop / targets")
+i_show_historical_plans = input.bool(true, "Show historical trade plans")
+i_show_study_results = input.bool(true, "Study historical plan outcomes")
+i_show_outcome_labels = input.bool(true, "Show TP / SL result labels")
+i_study_max_bars = input.int(60, "Study max bars after entry", minval=5, maxval=240)
+i_show_sweep_labels = input.bool(false, "Show ICT sweep labels")
+i_show_backgrounds = input.bool(false, "Show session shading")
+i_webhook_secret = input.string("", "Webhook secret")
+
+i_orb_minutes = input.int(10, "ORB window minutes", minval=5, maxval=30)
+i_vol_mult = input.float(1.5, "ORB volume multiplier", minval=1.0, step=0.25)
+i_vwap_proximity = input.int(4, "VWAP pullback proximity ticks", minval=1, maxval=12)
+i_ict_pivot_len = input.int(3, "ICT liquidity pivot length", minval=2, maxval=10)
+i_ict_sweep_lookback = input.int(8, "ICT bars after sweep", minval=1, maxval=30)
+i_min_fvg_ticks = input.int(2, "ICT minimum FVG ticks", minval=1, maxval=20)
+i_use_am = input.bool(true, "Use 10-11 AM Silver Bullet")
+i_use_pm = input.bool(true, "Use 2-3 PM Silver Bullet")
+
+NY_TZ = "America/New_York"
+mins = hour(time, NY_TZ) * 60 + minute(time, NY_TZ)
+is_mes = str.contains(syminfo.ticker, "MES")
+is_mnq = str.contains(syminfo.ticker, "MNQ")
+is_mgc = str.contains(syminfo.ticker, "MGC")
+tick_size = is_mgc ? 0.10 : 0.25
+stop_ticks = is_mgc ? 50 : is_mnq ? 16 : 10
+proximity = i_vwap_proximity * tick_size
+
+vwap_val = ta.vwap(hlc3)
+ema9 = ta.ema(close, 9)
+ema20 = ta.ema(close, 20)
+rsi_val = ta.rsi(close, 14)
+vol_avg = ta.sma(volume, 5)
+vol_ratio = vol_avg > 0 ? volume / vol_avg : 0.0
+rsi_neutral = rsi_val >= 40 and rsi_val <= 60
+
+session_open = timestamp(NY_TZ, year, month, dayofmonth, 9, 30, 0)
+orb_end = session_open + i_orb_minutes * 60 * 1000
+orb_trade_end = timestamp(NY_TZ, year, month, dayofmonth, 11, 0, 0)
+in_orb_period = time >= session_open and time < orb_end
+in_orb_trade_window = time >= orb_end and time < orb_trade_end
+is_new_day = ta.change(dayofmonth) != 0
+
+var float orb_high = na
+var float orb_low = na
+var bool orb_set = false
+var line orb_high_line = na
+var line orb_low_line = na
+
+if is_new_day
+    orb_high := na
+    orb_low := na
+    orb_set := false
+
+if in_orb_period
+    orb_high := na(orb_high) ? high : math.max(orb_high, high)
+    orb_low := na(orb_low) ? low : math.min(orb_low, low)
+
+if time >= orb_end and not orb_set and not na(orb_high)
+    orb_set := true
+
+if i_show_orb and orb_set and barstate.islast
+    line.delete(orb_high_line)
+    line.delete(orb_low_line)
+    orb_high_line := line.new(bar_index - 80, orb_high, bar_index, orb_high, color=color.new(color.white, 55), width=1, style=line.style_dashed)
+    orb_low_line := line.new(bar_index - 80, orb_low, bar_index, orb_low, color=color.new(color.white, 55), width=1, style=line.style_dashed)
+
+orb_long = orb_set and in_orb_trade_window and close > orb_high and open <= orb_high and close > vwap_val and volume >= vol_avg * i_vol_mult and rsi_neutral
+orb_short = orb_set and in_orb_trade_window and close < orb_low and open >= orb_low and close < vwap_val and volume >= vol_avg * i_vol_mult and rsi_neutral
+
+var int vwap_crosses = 0
+var bool prev_above = na
+if is_new_day
+    vwap_crosses := 0
+    prev_above := close > vwap_val
+currently_above = close > vwap_val
+if not na(prev_above) and currently_above != prev_above
+    vwap_crosses += 1
+prev_above := currently_above
+
+in_vwap_window = (mins >= 9 * 60 + 40 and mins < 11 * 60) or (mins >= 13 * 60 + 30 and mins < 15 * 60)
+not_choppy = vwap_crosses < 3
+uptrend = ema9 > ema20
+downtrend = ema9 < ema20
+vwap_long = in_vwap_window and close[2] > vwap_val and close[1] > vwap_val and low[1] <= vwap_val + proximity and close > vwap_val and close > close[1] and volume[1] < volume[2] and not_choppy and uptrend and rsi_val >= 35 and rsi_val <= 65
+vwap_short = in_vwap_window and close[2] < vwap_val and close[1] < vwap_val and high[1] >= vwap_val - proximity and close < vwap_val and close < close[1] and volume[1] < volume[2] and not_choppy and downtrend and rsi_val >= 35 and rsi_val <= 65
+
+in_am_window = i_use_am and mins >= 10 * 60 and mins < 11 * 60
+in_pm_window = i_use_pm and mins >= 14 * 60 and mins < 15 * 60
+in_ict_window = in_am_window or in_pm_window
+window_name = in_am_window ? "NY_AM_SILVER_BULLET" : in_pm_window ? "NY_PM_SILVER_BULLET" : "OUTSIDE"
+
+ph = ta.pivothigh(high, i_ict_pivot_len, i_ict_pivot_len)
+pl = ta.pivotlow(low, i_ict_pivot_len, i_ict_pivot_len)
+var float last_bsl = na
+var float last_ssl = na
+if not na(ph)
+    last_bsl := ph
+if not na(pl)
+    last_ssl := pl
+
+ssl_sweep = in_ict_window and not na(last_ssl) and low < last_ssl and close > last_ssl
+bsl_sweep = in_ict_window and not na(last_bsl) and high > last_bsl and close < last_bsl
+var int last_ssl_sweep_bar = na
+var int last_bsl_sweep_bar = na
+var float last_ssl_sweep_low = na
+var float last_bsl_sweep_high = na
+if ssl_sweep
+    last_ssl_sweep_bar := bar_index
+    last_ssl_sweep_low := low
+if bsl_sweep
+    last_bsl_sweep_bar := bar_index
+    last_bsl_sweep_high := high
+
+min_fvg = i_min_fvg_ticks * tick_size
+bull_fvg_low = high[2]
+bull_fvg_high = low
+bear_fvg_low = high
+bear_fvg_high = low[2]
+bull_fvg = low > high[2] and (low - high[2]) >= min_fvg
+bear_fvg = high < low[2] and (low[2] - high) >= min_fvg
+recent_ssl_sweep = not na(last_ssl_sweep_bar) and bar_index - last_ssl_sweep_bar <= i_ict_sweep_lookback
+recent_bsl_sweep = not na(last_bsl_sweep_bar) and bar_index - last_bsl_sweep_bar <= i_ict_sweep_lookback
+ict_long = in_ict_window and recent_ssl_sweep and bull_fvg
+ict_short = in_ict_window and recent_bsl_sweep and bear_fvg
+
+f_grade(_base, _aligned, _volume_ok, _rsi_ok, _clean_window) =>
+    score = _base + (_aligned ? 2 : 0) + (_volume_ok ? 2 : 0) + (_rsi_ok ? 1 : 0) + (_clean_window ? 1 : 0)
+    label = score >= 8 ? "A+" : score >= 7 ? "A" : score >= 6 ? "B" : "C"
+    [score, label]
+
+f_payload(_action, _strategy, _entry, _stop, _t1, _t2, _stop_ticks, _score, _grade, _comment) =>
+    '{"symbol":"' + syminfo.ticker + '","secret":"' + i_webhook_secret + '","action":"' + _action + '","strategy":"' + _strategy + '","price":' + str.tostring(_entry, "#.#####") + ',"stop":' + str.tostring(_stop, "#.#####") + ',"target1":' + str.tostring(_t1, "#.#####") + ',"target2":' + str.tostring(_t2, "#.#####") + ',"stop_ticks":' + str.tostring(_stop_ticks) + ',"t1_ticks":' + str.tostring(_stop_ticks * 2) + ',"t2_ticks":' + str.tostring(_stop_ticks * 3) + ',"tv_score":' + str.tostring(_score) + ',"tv_grade":"' + _grade + '","vwap":' + str.tostring(vwap_val, "#.#####") + ',"rsi":' + str.tostring(rsi_val, "#.##") + ',"volume_ratio":' + str.tostring(vol_ratio, "#.##") + ',"window":"' + window_name + '","comment":"' + _comment + '"}'
+
+f_clear_line(_line) =>
+    if not na(_line)
+        line.delete(_line)
+
+f_clear_label(_label) =>
+    if not na(_label)
+        label.delete(_label)
+
+f_price_line(_price, _text, _color) =>
+    line.new(bar_index, _price, bar_index + 60, _price, extend=extend.none, color=_color, width=2, style=line.style_solid)
+
+f_price_label(_price, _text, _color) =>
+    label.new(bar_index + 60, _price, _text + "  " + str.tostring(_price, "#.#####"), style=label.style_label_left, color=_color, textcolor=color.white, size=size.small)
+
+orb_long_entry = close
+orb_long_stop = close - stop_ticks * tick_size
+orb_short_entry = close
+orb_short_stop = close + stop_ticks * tick_size
+
+vwap_long_entry = close
+vwap_long_stop = math.min(low[1], low) - tick_size * 2
+vwap_long_stop_ticks = math.max(1, int(math.round(math.abs(vwap_long_entry - vwap_long_stop) / tick_size)))
+vwap_short_entry = close
+vwap_short_stop = math.max(high[1], high) + tick_size * 2
+vwap_short_stop_ticks = math.max(1, int(math.round(math.abs(vwap_short_stop - vwap_short_entry) / tick_size)))
+
+ict_long_entry = (bull_fvg_low + bull_fvg_high) / 2.0
+ict_long_stop = math.min(last_ssl_sweep_low, bull_fvg_low) - tick_size
+ict_long_stop_ticks = math.max(1, int(math.round(math.abs(ict_long_entry - ict_long_stop) / tick_size)))
+ict_short_entry = (bear_fvg_low + bear_fvg_high) / 2.0
+ict_short_stop = math.max(last_bsl_sweep_high, bear_fvg_high) + tick_size
+ict_short_stop_ticks = math.max(1, int(math.round(math.abs(ict_short_stop - ict_short_entry) / tick_size)))
+
+[orb_long_score, orb_long_grade] = f_grade(4, close > vwap_val, volume >= vol_avg * i_vol_mult, rsi_neutral, in_orb_trade_window)
+[orb_short_score, orb_short_grade] = f_grade(4, close < vwap_val, volume >= vol_avg * i_vol_mult, rsi_neutral, in_orb_trade_window)
+[vwap_long_score, vwap_long_grade] = f_grade(4, uptrend, vol_ratio >= 1.0, rsi_val >= 35 and rsi_val <= 65, not_choppy)
+[vwap_short_score, vwap_short_grade] = f_grade(4, downtrend, vol_ratio >= 1.0, rsi_val >= 35 and rsi_val <= 65, not_choppy)
+[ict_long_score, ict_long_grade] = f_grade(5, close > vwap_val, vol_ratio >= 1.0, rsi_val >= 35 and rsi_val <= 65, in_ict_window)
+[ict_short_score, ict_short_grade] = f_grade(5, close < vwap_val, vol_ratio >= 1.0, rsi_val >= 35 and rsi_val <= 65, in_ict_window)
+draw_trade_plan = i_show_trade_plan and (i_show_historical_plans or barstate.isrealtime)
+
+var line plan_entry_line = na
+var line plan_stop_line = na
+var line plan_t1_line = na
+var line plan_t2_line = na
+var label plan_entry_label = na
+var label plan_stop_label = na
+var label plan_t1_label = na
+var label plan_t2_label = na
+var label plan_grade_label = na
+
+f_draw_plan(_direction, _strategy, _entry, _stop, _t1, _t2, _grade, _score) =>
+    entry_color = color.new(color.blue, 0)
+    stop_color = color.new(color.red, 0)
+    target_color = color.new(color.green, 0)
+    grade_color = _grade == "A+" ? color.new(color.green, 0) : _grade == "A" ? color.new(color.teal, 0) : _grade == "B" ? color.new(color.orange, 0) : color.new(color.red, 0)
+    f_price_line(_entry, "Entry", entry_color)
+    f_price_line(_stop, "Stop", stop_color)
+    f_price_line(_t1, "TP1", target_color)
+    f_price_line(_t2, "TP2", target_color)
+    f_price_label(_entry, "Entry", entry_color)
+    f_price_label(_stop, "SL", stop_color)
+    f_price_label(_t1, "TP1", target_color)
+    f_price_label(_t2, "TP2", target_color)
+    label.new(bar_index, _direction == "Long" ? low : high, _grade + " (" + str.tostring(_score) + "/10) " + _strategy + "\n" + _direction + " setup", style=_direction == "Long" ? label.style_label_up : label.style_label_down, color=grade_color, textcolor=color.white, size=size.normal)
+
+var array<bool> study_active = array.new_bool()
+var array<bool> study_long = array.new_bool()
+var array<float> study_entry = array.new_float()
+var array<float> study_stop = array.new_float()
+var array<float> study_t1 = array.new_float()
+var array<float> study_t2 = array.new_float()
+var array<int> study_start = array.new_int()
+var array<bool> study_t1_seen = array.new_bool()
+var array<string> study_grade = array.new_string()
+var array<string> study_strategy = array.new_string()
+var int study_total = 0
+var int study_tp1 = 0
+var int study_tp2 = 0
+var int study_sl = 0
+var int study_expired = 0
+var float study_r_total = 0.0
+var int study_orb_total = 0
+var int study_vwap_total = 0
+var int study_ict_total = 0
+var float study_orb_r = 0.0
+var float study_vwap_r = 0.0
+var float study_ict_r = 0.0
+var int study_a_total = 0
+var int study_b_total = 0
+var float study_a_r = 0.0
+var float study_b_r = 0.0
+
+f_register_plan(_is_long, _strategy, _entry, _stop, _t1, _t2, _grade) =>
+    if i_show_study_results
+        array.push(study_active, true)
+        array.push(study_long, _is_long)
+        array.push(study_entry, _entry)
+        array.push(study_stop, _stop)
+        array.push(study_t1, _t1)
+        array.push(study_t2, _t2)
+        array.push(study_start, bar_index)
+        array.push(study_t1_seen, false)
+        array.push(study_grade, _grade)
+        array.push(study_strategy, _strategy)
+
+if orb_long
+    orb_t1 = orb_long_entry + stop_ticks * tick_size * 2
+    orb_t2 = orb_long_entry + stop_ticks * tick_size * 3
+    if draw_trade_plan
+        f_draw_plan("Long", "ORB", orb_long_entry, orb_long_stop, orb_t1, orb_t2, orb_long_grade, orb_long_score)
+    f_register_plan(true, "ORB", orb_long_entry, orb_long_stop, orb_t1, orb_t2, orb_long_grade)
+    alert(f_payload("buy", "ORB_BREAKOUT", orb_long_entry, orb_long_stop, orb_t1, orb_t2, stop_ticks, orb_long_score, orb_long_grade, "ORB long break"), alert.freq_once_per_bar_close)
+if orb_short
+    orb_t1 = orb_short_entry - stop_ticks * tick_size * 2
+    orb_t2 = orb_short_entry - stop_ticks * tick_size * 3
+    if draw_trade_plan
+        f_draw_plan("Short", "ORB", orb_short_entry, orb_short_stop, orb_t1, orb_t2, orb_short_grade, orb_short_score)
+    f_register_plan(false, "ORB", orb_short_entry, orb_short_stop, orb_t1, orb_t2, orb_short_grade)
+    alert(f_payload("sell", "ORB_BREAKOUT", orb_short_entry, orb_short_stop, orb_t1, orb_t2, stop_ticks, orb_short_score, orb_short_grade, "ORB short break"), alert.freq_once_per_bar_close)
+if vwap_long
+    vwap_t1 = vwap_long_entry + math.abs(vwap_long_entry - vwap_long_stop) * 2
+    vwap_t2 = vwap_long_entry + math.abs(vwap_long_entry - vwap_long_stop) * 3
+    if draw_trade_plan
+        f_draw_plan("Long", "VWAP", vwap_long_entry, vwap_long_stop, vwap_t1, vwap_t2, vwap_long_grade, vwap_long_score)
+    f_register_plan(true, "VWAP", vwap_long_entry, vwap_long_stop, vwap_t1, vwap_t2, vwap_long_grade)
+    alert(f_payload("buy", "VWAP_PULLBACK", vwap_long_entry, vwap_long_stop, vwap_t1, vwap_t2, vwap_long_stop_ticks, vwap_long_score, vwap_long_grade, "VWAP pullback long"), alert.freq_once_per_bar_close)
+if vwap_short
+    vwap_t1 = vwap_short_entry - math.abs(vwap_short_stop - vwap_short_entry) * 2
+    vwap_t2 = vwap_short_entry - math.abs(vwap_short_stop - vwap_short_entry) * 3
+    if draw_trade_plan
+        f_draw_plan("Short", "VWAP", vwap_short_entry, vwap_short_stop, vwap_t1, vwap_t2, vwap_short_grade, vwap_short_score)
+    f_register_plan(false, "VWAP", vwap_short_entry, vwap_short_stop, vwap_t1, vwap_t2, vwap_short_grade)
+    alert(f_payload("sell", "VWAP_PULLBACK", vwap_short_entry, vwap_short_stop, vwap_t1, vwap_t2, vwap_short_stop_ticks, vwap_short_score, vwap_short_grade, "VWAP pullback short"), alert.freq_once_per_bar_close)
+if ict_long
+    ict_t1 = ict_long_entry + math.abs(ict_long_entry - ict_long_stop) * 2
+    ict_t2 = ict_long_entry + math.abs(ict_long_entry - ict_long_stop) * 3
+    if draw_trade_plan
+        f_draw_plan("Long", "ICT", ict_long_entry, ict_long_stop, ict_t1, ict_t2, ict_long_grade, ict_long_score)
+    f_register_plan(true, "ICT", ict_long_entry, ict_long_stop, ict_t1, ict_t2, ict_long_grade)
+    alert(f_payload("buy", "ICT_SILVER_BULLET", ict_long_entry, ict_long_stop, ict_t1, ict_t2, ict_long_stop_ticks, ict_long_score, ict_long_grade, "ICT bullish FVG after SSL sweep"), alert.freq_once_per_bar_close)
+if ict_short
+    ict_t1 = ict_short_entry - math.abs(ict_short_stop - ict_short_entry) * 2
+    ict_t2 = ict_short_entry - math.abs(ict_short_stop - ict_short_entry) * 3
+    if draw_trade_plan
+        f_draw_plan("Short", "ICT", ict_short_entry, ict_short_stop, ict_t1, ict_t2, ict_short_grade, ict_short_score)
+    f_register_plan(false, "ICT", ict_short_entry, ict_short_stop, ict_t1, ict_t2, ict_short_grade)
+    alert(f_payload("sell", "ICT_SILVER_BULLET", ict_short_entry, ict_short_stop, ict_t1, ict_t2, ict_short_stop_ticks, ict_short_score, ict_short_grade, "ICT bearish FVG after BSL sweep"), alert.freq_once_per_bar_close)
+
+if i_show_study_results and array.size(study_active) > 0
+    for i = 0 to array.size(study_active) - 1
+        if array.get(study_active, i)
+            is_long_plan = array.get(study_long, i)
+            plan_stop = array.get(study_stop, i)
+            plan_t1 = array.get(study_t1, i)
+            plan_t2 = array.get(study_t2, i)
+            plan_start = array.get(study_start, i)
+            t1_seen = array.get(study_t1_seen, i)
+            plan_strategy = array.get(study_strategy, i)
+            plan_grade = array.get(study_grade, i)
+            stop_hit = is_long_plan ? low <= plan_stop : high >= plan_stop
+            t1_hit = is_long_plan ? high >= plan_t1 : low <= plan_t1
+            t2_hit = is_long_plan ? high >= plan_t2 : low <= plan_t2
+            if t1_hit and not t1_seen
+                array.set(study_t1_seen, i, true)
+                t1_seen := true
+            bars_open = bar_index - plan_start
+            outcome = ""
+            outcome_r = 0.0
+            outcome_color = color.new(color.gray, 0)
+            if stop_hit
+                outcome := t1_seen ? "TP1 then SL" : "SL"
+                outcome_r := t1_seen ? 0.5 : -1.0
+                outcome_color := t1_seen ? color.new(color.orange, 0) : color.new(color.red, 0)
+            else if t2_hit
+                outcome := "TP2"
+                outcome_r := 2.5
+                outcome_color := color.new(color.green, 0)
+            else if bars_open >= i_study_max_bars
+                outcome := t1_seen ? "TP1 only" : "Expired"
+                outcome_r := t1_seen ? 0.5 : 0.0
+                outcome_color := t1_seen ? color.new(color.teal, 0) : color.new(color.gray, 0)
+            if outcome != ""
+                array.set(study_active, i, false)
+                study_total += 1
+                study_r_total += outcome_r
+                if plan_strategy == "ORB"
+                    study_orb_total += 1
+                    study_orb_r += outcome_r
+                else if plan_strategy == "VWAP"
+                    study_vwap_total += 1
+                    study_vwap_r += outcome_r
+                else if plan_strategy == "ICT"
+                    study_ict_total += 1
+                    study_ict_r += outcome_r
+                if plan_grade == "A+" or plan_grade == "A"
+                    study_a_total += 1
+                    study_a_r += outcome_r
+                else
+                    study_b_total += 1
+                    study_b_r += outcome_r
+                if outcome == "TP2"
+                    study_tp2 += 1
+                else if outcome == "TP1 only" or outcome == "TP1 then SL"
+                    study_tp1 += 1
+                else if outcome == "SL"
+                    study_sl += 1
+                else
+                    study_expired += 1
+                if i_show_outcome_labels
+                    label.new(bar_index, close, outcome + "  " + str.tostring(outcome_r, "#.##") + "R", style=label.style_label_left, color=outcome_color, textcolor=color.white, size=size.tiny)
+
+var table study_table = table.new(position.top_right, 2, 12, bgcolor=color.new(color.black, 10), border_color=color.new(color.white, 80), border_width=1)
+if i_show_study_results and barstate.islast
+    win_count = study_tp2 + study_tp1
+    studied = math.max(study_total, 1)
+    win_rate = study_total > 0 ? (win_count / study_total) * 100 : 0.0
+    avg_r = study_total > 0 ? study_r_total / study_total : 0.0
+    orb_avg = study_orb_total > 0 ? study_orb_r / study_orb_total : na
+    vwap_avg = study_vwap_total > 0 ? study_vwap_r / study_vwap_total : na
+    ict_avg = study_ict_total > 0 ? study_ict_r / study_ict_total : na
+    a_avg = study_a_total > 0 ? study_a_r / study_a_total : na
+    b_avg = study_b_total > 0 ? study_b_r / study_b_total : na
+    orb_txt = study_orb_total > 0 ? str.tostring(study_orb_total) + " / " + str.tostring(orb_avg, "#.##") + "R" : "-"
+    vwap_txt = study_vwap_total > 0 ? str.tostring(study_vwap_total) + " / " + str.tostring(vwap_avg, "#.##") + "R" : "-"
+    ict_txt = study_ict_total > 0 ? str.tostring(study_ict_total) + " / " + str.tostring(ict_avg, "#.##") + "R" : "-"
+    a_txt = study_a_total > 0 ? str.tostring(study_a_total) + " / " + str.tostring(a_avg, "#.##") + "R" : "-"
+    b_txt = study_b_total > 0 ? str.tostring(study_b_total) + " / " + str.tostring(b_avg, "#.##") + "R" : "-"
+    table.cell(study_table, 0, 0, "Plan Study", text_color=color.white, bgcolor=color.new(color.blue, 20))
+    table.cell(study_table, 1, 0, syminfo.ticker, text_color=color.white, bgcolor=color.new(color.blue, 20))
+    table.cell(study_table, 0, 1, "Closed", text_color=color.white)
+    table.cell(study_table, 1, 1, str.tostring(study_total), text_color=color.white)
+    table.cell(study_table, 0, 2, "TP2", text_color=color.white)
+    table.cell(study_table, 1, 2, str.tostring(study_tp2), text_color=color.lime)
+    table.cell(study_table, 0, 3, "TP1 only", text_color=color.white)
+    table.cell(study_table, 1, 3, str.tostring(study_tp1), text_color=color.teal)
+    table.cell(study_table, 0, 4, "SL", text_color=color.white)
+    table.cell(study_table, 1, 4, str.tostring(study_sl), text_color=color.red)
+    table.cell(study_table, 0, 5, "Expired", text_color=color.white)
+    table.cell(study_table, 1, 5, str.tostring(study_expired), text_color=color.gray)
+    table.cell(study_table, 0, 6, "WR / Avg R", text_color=color.white)
+    table.cell(study_table, 1, 6, str.tostring(win_rate, "#.0") + "% / " + str.tostring(avg_r, "#.##"), text_color=avg_r > 0 ? color.lime : color.red)
+    table.cell(study_table, 0, 7, "ORB n/avg", text_color=color.white)
+    table.cell(study_table, 1, 7, orb_txt, text_color=na(orb_avg) ? color.gray : orb_avg > 0 ? color.lime : color.red)
+    table.cell(study_table, 0, 8, "VWAP n/avg", text_color=color.white)
+    table.cell(study_table, 1, 8, vwap_txt, text_color=na(vwap_avg) ? color.gray : vwap_avg > 0 ? color.lime : color.red)
+    table.cell(study_table, 0, 9, "ICT n/avg", text_color=color.white)
+    table.cell(study_table, 1, 9, ict_txt, text_color=na(ict_avg) ? color.gray : ict_avg > 0 ? color.lime : color.red)
+    table.cell(study_table, 0, 10, "A/A+ n/avg", text_color=color.white)
+    table.cell(study_table, 1, 10, a_txt, text_color=na(a_avg) ? color.gray : a_avg > 0 ? color.lime : color.red)
+    table.cell(study_table, 0, 11, "B/C n/avg", text_color=color.white)
+    table.cell(study_table, 1, 11, b_txt, text_color=na(b_avg) ? color.gray : b_avg > 0 ? color.lime : color.red)
+
+plot(i_show_vwap ? vwap_val : na, "VWAP", color=color.new(color.aqua, 0), linewidth=2)
+plot(i_show_vwap ? ema9 : na, "EMA 9", color=color.new(color.yellow, 20), linewidth=1)
+plot(i_show_vwap ? ema20 : na, "EMA 20", color=color.new(color.orange, 20), linewidth=1)
+plot(i_show_ict ? last_bsl : na, "Buyside Liquidity", color=color.new(color.red, 70), style=plot.style_linebr)
+plot(i_show_ict ? last_ssl : na, "Sellside Liquidity", color=color.new(color.green, 70), style=plot.style_linebr)
+
+if i_show_fvg and bull_fvg
+    box.new(bar_index - 2, bull_fvg_high, bar_index, bull_fvg_low, bgcolor=color.new(color.green, 92), border_color=color.new(color.green, 75))
+if i_show_fvg and bear_fvg
+    box.new(bar_index - 2, bear_fvg_high, bar_index, bear_fvg_low, bgcolor=color.new(color.red, 92), border_color=color.new(color.red, 75))
+
+if i_show_signal_labels and orb_long
+    label.new(bar_index, low, "ORB LONG", style=label.style_label_up, color=color.new(color.green, 10), textcolor=color.white, size=size.small)
+if i_show_signal_labels and orb_short
+    label.new(bar_index, high, "ORB SHORT", style=label.style_label_down, color=color.new(color.red, 10), textcolor=color.white, size=size.small)
+if i_show_signal_labels and vwap_long
+    label.new(bar_index, low, "VWAP LONG", style=label.style_label_up, color=color.new(color.green, 10), textcolor=color.white, size=size.small)
+if i_show_signal_labels and vwap_short
+    label.new(bar_index, high, "VWAP SHORT", style=label.style_label_down, color=color.new(color.red, 10), textcolor=color.white, size=size.small)
+if i_show_sweep_labels and ssl_sweep
+    label.new(bar_index, low, "SSL", style=label.style_label_up, color=color.new(color.green, 45), textcolor=color.white, size=size.tiny)
+if i_show_sweep_labels and bsl_sweep
+    label.new(bar_index, high, "BSL", style=label.style_label_down, color=color.new(color.red, 45), textcolor=color.white, size=size.tiny)
+
+bgcolor(i_show_backgrounds and in_orb_period ? color.new(color.yellow, 96) : na)
+bgcolor(i_show_backgrounds and in_orb_trade_window ? color.new(color.green, 98) : na)
+bgcolor(i_show_backgrounds and in_am_window ? color.new(color.yellow, 96) : i_show_backgrounds and in_pm_window ? color.new(color.purple, 96) : na)
