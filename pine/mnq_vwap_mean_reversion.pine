@@ -1,0 +1,288 @@
+//@version=6
+strategy("MNQ VWAP Mean Reversion Pro - Original + A+ Grade", overlay = true, pyramiding = 0, initial_capital = 100000, currency = currency.USD, default_qty_type = strategy.fixed, default_qty_value = 1, margin_long = 1, margin_short = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 1.25, slippage = 1, process_orders_on_close = true, max_labels_count = 500, max_lines_count = 500)
+
+// Position sizing
+accountRiskDollars = input.float(300.0, "Risk dollars per trade", minval = 1, step = 25, group = "Risk")
+pointValueDollars = input.float(2.0, "MNQ dollars per point", minval = 0.01, step = 0.25, group = "Risk")
+maxContracts = input.int(50, "Max MNQ contracts", minval = 1, maxval = 200, group = "Risk")
+closeAtSessionEnd = input.bool(true, "Close open trade at RTH end", group = "Risk")
+
+// Presets
+preset = input.string("Auto 1m/5m", "Preset", options = ["Auto 1m/5m", "5m max-profit", "1m max-profit", "Conservative", "Custom"], group = "Core")
+customStretch = input.float(0.8, "Custom VWAP stretch ATR multiple", minval = 0.1, step = 0.1, group = "Core")
+customStop = input.float(0.6, "Custom stop ATR multiple", minval = 0.1, step = 0.1, group = "Core")
+targetR = input.float(3.0, "Take-profit R multiple", minval = 0.5, step = 0.5, group = "Core")
+rsiLow = input.float(35.0, "Long RSI threshold", minval = 1, maxval = 50, step = 1, group = "Core")
+rsiHigh = input.float(65.0, "Short RSI threshold", minval = 50, maxval = 99, step = 1, group = "Core")
+
+// A+ grade overlay. These filters do not block original entries; they grade them.
+aPlusStretch = input.float(1.0, "A+ VWAP stretch ATR multiple", minval = 0.1, step = 0.1, group = "A+ Grade")
+aPlusRsiLow = input.float(30.0, "A+ long RSI threshold", minval = 1, maxval = 50, step = 1, group = "A+ Grade")
+aPlusRsiHigh = input.float(70.0, "A+ short RSI threshold", minval = 50, maxval = 99, step = 1, group = "A+ Grade")
+aPlusSession = input.session("0945-1130,1400-1600", "A+ trade windows", group = "A+ Grade")
+useAPlusHTF = input.bool(true, "A+ requires 15m/5m exhaustion", group = "A+ Grade")
+
+isOneMinute = timeframe.isminutes and timeframe.multiplier <= 1
+autoStretch = isOneMinute ? 1.0 : 0.8
+autoStop = isOneMinute ? 1.2 : 0.6
+stretchAtrMult = preset == "Auto 1m/5m" ? autoStretch : preset == "5m max-profit" ? 0.8 : preset == "1m max-profit" ? 1.0 : preset == "Conservative" ? 1.2 : customStretch
+stopAtrMult = preset == "Auto 1m/5m" ? autoStop : preset == "5m max-profit" ? 0.6 : preset == "1m max-profit" ? 1.2 : preset == "Conservative" ? 1.0 : customStop
+
+// Time filters
+tradeSession = input.session("0935-1130,1400-1600", "Trade windows", group = "Time")
+rthSession = input.session("0930-1600", "VWAP reset session", group = "Time")
+tz = input.string("America/New_York", "Session timezone", group = "Time")
+cooldownBars = input.int(6, "Cooldown bars after signal", minval = 0, maxval = 100, group = "Time")
+maxSignalsPerDay = input.int(2, "Max signals per day", minval = 1, maxval = 10, group = "Time")
+maxLossesPerDay = input.int(2, "Stop after losses per day", minval = 1, maxval = 5, group = "Time")
+
+// Quality filters
+requireReversalCandle = input.bool(true, "Require reversal candle", group = "Quality Filters")
+blockStrongTrend = input.bool(true, "Block strong trend days", group = "Quality Filters")
+blockFlatVwap = input.bool(true, "Block flat VWAP chop", group = "Quality Filters")
+useVolumeFilter = input.bool(false, "Require above-average volume", group = "Quality Filters")
+useHTFBiasFilter = input.bool(false, "Use 15m/5m HTF exhaustion filter", group = "Quality Filters")
+maxAtrStopPoints = input.float(80.0, "Skip if stop is wider than points", minval = 1, step = 1, group = "Quality Filters")
+minAtrStopPoints = input.float(8.0, "Skip if stop is tighter than points", minval = 0.25, step = 0.25, group = "Quality Filters")
+
+// Display
+showLevels = input.bool(true, "Show active entry/stop/target", group = "Display")
+showLabels = input.bool(true, "Show signal labels", group = "Display")
+showDashboard = input.bool(true, "Show dashboard", group = "Display")
+showBackground = input.bool(true, "Color blocked zones", group = "Display")
+
+inRth = not na(time(timeframe.period, rthSession, tz))
+inTradeWindow = not na(time(timeframe.period, tradeSession, tz))
+inAPlusWindow = not na(time(timeframe.period, aPlusSession, tz))
+newRth = inRth and not inRth[1]
+endRth = not inRth and inRth[1]
+
+var float cumPV = na
+var float cumVol = na
+
+if newRth
+    cumPV := hlc3 * volume
+    cumVol := volume
+else if inRth
+    cumPV := nz(cumPV) + hlc3 * volume
+    cumVol := nz(cumVol) + volume
+else
+    cumPV := na
+    cumVol := na
+
+vwap = inRth and cumVol > 0 ? cumPV / cumVol : na
+atr14 = ta.atr(14)
+rsi14 = ta.rsi(close, 14)
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+volSma20 = ta.sma(volume, 20)
+
+vwapDistance = close - vwap
+vwapStretchAtr = not na(vwap) and atr14 > 0 ? math.abs(vwapDistance) / atr14 : na
+aboveVwapCount = math.sum(close > vwap ? 1.0 : 0.0, 8)
+belowVwapCount = math.sum(close < vwap ? 1.0 : 0.0, 8)
+vwapSlope8 = vwap - vwap[8]
+ema20Slope8 = ema20 - ema20[8]
+
+strongBullTrend = close > ema20 and ema20 > ema50 and ema50 > ema200 and vwapSlope8 > atr14 * 0.45 and ema20Slope8 > atr14 * 0.45 and aboveVwapCount >= 7
+strongBearTrend = close < ema20 and ema20 < ema50 and ema50 < ema200 and vwapSlope8 < -atr14 * 0.45 and ema20Slope8 < -atr14 * 0.45 and belowVwapCount >= 7
+flatVwapChop = math.abs(vwapSlope8) < atr14 * 0.08 and ta.highest(high, 12) - ta.lowest(low, 12) < atr14 * 1.8
+volumeOk = not useVolumeFilter or volume >= volSma20
+
+htfClose15 = request.security(syminfo.tickerid, "15", close, barmerge.gaps_off, barmerge.lookahead_off)
+htfEma20_15 = request.security(syminfo.tickerid, "15", ta.ema(close, 20), barmerge.gaps_off, barmerge.lookahead_off)
+htfRsi15 = request.security(syminfo.tickerid, "15", ta.rsi(close, 14), barmerge.gaps_off, barmerge.lookahead_off)
+htfClose5 = request.security(syminfo.tickerid, "5", close, barmerge.gaps_off, barmerge.lookahead_off)
+htfEma20_5 = request.security(syminfo.tickerid, "5", ta.ema(close, 20), barmerge.gaps_off, barmerge.lookahead_off)
+htfRsi5 = request.security(syminfo.tickerid, "5", ta.rsi(close, 14), barmerge.gaps_off, barmerge.lookahead_off)
+
+htfLongOk = not useHTFBiasFilter or ((htfClose15 <= htfEma20_15 or htfRsi15 <= 45) and (htfClose5 <= htfEma20_5 or htfRsi5 <= 45))
+htfShortOk = not useHTFBiasFilter or ((htfClose15 >= htfEma20_15 or htfRsi15 >= 55) and (htfClose5 >= htfEma20_5 or htfRsi5 >= 55))
+htfLongAPlus = not useAPlusHTF or ((htfClose15 <= htfEma20_15 or htfRsi15 <= 45) and (htfClose5 <= htfEma20_5 or htfRsi5 <= 45))
+htfShortAPlus = not useAPlusHTF or ((htfClose15 >= htfEma20_15 or htfRsi15 >= 55) and (htfClose5 >= htfEma20_5 or htfRsi5 >= 55))
+
+longStretch = not na(vwap) and vwap - close >= stretchAtrMult * atr14 and rsi14 <= rsiLow
+shortStretch = not na(vwap) and close - vwap >= stretchAtrMult * atr14 and rsi14 >= rsiHigh
+
+body = math.abs(close - open)
+barRange = math.max(high - low, syminfo.mintick)
+longReversal = close > open and close > close[1] and close > low + barRange * 0.55 and body >= barRange * 0.25
+shortReversal = close < open and close < close[1] and close < high - barRange * 0.55 and body >= barRange * 0.25
+
+longEntry = close
+longStop = close - stopAtrMult * atr14
+longRisk = longEntry - longStop
+longTarget = longEntry + targetR * longRisk
+
+shortEntry = close
+shortStop = close + stopAtrMult * atr14
+shortRisk = shortStop - shortEntry
+shortTarget = shortEntry - targetR * shortRisk
+
+longRiskOk = longRisk >= minAtrStopPoints and longRisk <= maxAtrStopPoints
+shortRiskOk = shortRisk >= minAtrStopPoints and shortRisk <= maxAtrStopPoints
+longQty = longRisk > 0 ? math.min(maxContracts, math.max(1, math.floor(accountRiskDollars / (longRisk * pointValueDollars)))) : 1
+shortQty = shortRisk > 0 ? math.min(maxContracts, math.max(1, math.floor(accountRiskDollars / (shortRisk * pointValueDollars)))) : 1
+
+var int daySignals = 0
+var int dayLosses = 0
+var int lastSignalBar = na
+var int lastClosedTrades = 0
+var float activeEntry = na
+var float activeStop = na
+var float activeTarget = na
+var int activeSide = 0
+var string activeGrade = ""
+
+if newRth
+    daySignals := 0
+    dayLosses := 0
+    activeEntry := na
+    activeStop := na
+    activeTarget := na
+    activeSide := 0
+    activeGrade := ""
+
+if strategy.closedtrades > lastClosedTrades
+    lastClosedIndex = strategy.closedtrades - 1
+    dayLosses += strategy.closedtrades.profit(lastClosedIndex) < 0 ? 1 : 0
+    lastClosedTrades := strategy.closedtrades
+    if strategy.position_size == 0
+        activeEntry := na
+        activeStop := na
+        activeTarget := na
+        activeSide := 0
+        activeGrade := ""
+
+cooldownOk = na(lastSignalBar) or bar_index - lastSignalBar > cooldownBars
+dayLimitOk = daySignals < maxSignalsPerDay
+lossLimitOk = dayLosses < maxLossesPerDay
+flatOk = strategy.position_size == 0
+trendOkLong = not blockStrongTrend or not strongBearTrend
+trendOkShort = not blockStrongTrend or not strongBullTrend
+chopOk = not blockFlatVwap or not flatVwapChop
+reversalOkLong = not requireReversalCandle or longReversal
+reversalOkShort = not requireReversalCandle or shortReversal
+
+rawLongSignal = inTradeWindow and longStretch and reversalOkLong and trendOkLong and chopOk and volumeOk and htfLongOk and longRiskOk
+rawShortSignal = inTradeWindow and shortStretch and reversalOkShort and trendOkShort and chopOk and volumeOk and htfShortOk and shortRiskOk
+
+longSignal = rawLongSignal and cooldownOk and dayLimitOk and lossLimitOk and flatOk
+shortSignal = rawShortSignal and cooldownOk and dayLimitOk and lossLimitOk and flatOk
+longAPlus = longSignal and inAPlusWindow and vwapStretchAtr >= aPlusStretch and rsi14 <= aPlusRsiLow and htfLongAPlus
+shortAPlus = shortSignal and inAPlusWindow and vwapStretchAtr >= aPlusStretch and rsi14 >= aPlusRsiHigh and htfShortAPlus
+signalGrade = longAPlus or shortAPlus ? "A+" : "B"
+
+if longSignal
+    daySignals += 1
+    lastSignalBar := bar_index
+    activeEntry := longEntry
+    activeStop := longStop
+    activeTarget := longTarget
+    activeSide := 1
+    activeGrade := signalGrade
+    if longAPlus
+        strategy.entry("A+ Long", strategy.long, qty = longQty)
+        strategy.exit("A+ Long TP/SL", "A+ Long", stop = activeStop, limit = activeTarget)
+    else
+        strategy.entry("B Long", strategy.long, qty = longQty)
+        strategy.exit("B Long TP/SL", "B Long", stop = activeStop, limit = activeTarget)
+
+if shortSignal
+    daySignals += 1
+    lastSignalBar := bar_index
+    activeEntry := shortEntry
+    activeStop := shortStop
+    activeTarget := shortTarget
+    activeSide := -1
+    activeGrade := signalGrade
+    if shortAPlus
+        strategy.entry("A+ Short", strategy.short, qty = shortQty)
+        strategy.exit("A+ Short TP/SL", "A+ Short", stop = activeStop, limit = activeTarget)
+    else
+        strategy.entry("B Short", strategy.short, qty = shortQty)
+        strategy.exit("B Short TP/SL", "B Short", stop = activeStop, limit = activeTarget)
+
+if strategy.position_size > 0
+    strategy.exit("A+ Long TP/SL", "A+ Long", stop = activeStop, limit = activeTarget)
+    strategy.exit("B Long TP/SL", "B Long", stop = activeStop, limit = activeTarget)
+
+if strategy.position_size < 0
+    strategy.exit("A+ Short TP/SL", "A+ Short", stop = activeStop, limit = activeTarget)
+    strategy.exit("B Short TP/SL", "B Short", stop = activeStop, limit = activeTarget)
+
+if closeAtSessionEnd and endRth
+    strategy.close_all("RTH close")
+
+plot(vwap, "Session VWAP", color = color.rgb(35, 115, 255), linewidth = 2)
+plot(ema20, "EMA 20", color = color.rgb(255, 170, 0))
+plot(ema50, "EMA 50", color = color.rgb(155, 155, 155))
+
+entryPlot = showLevels and strategy.position_size != 0 ? activeEntry : na
+stopPlot = showLevels and strategy.position_size != 0 ? activeStop : na
+targetPlot = showLevels and strategy.position_size != 0 ? activeTarget : na
+
+plot(entryPlot, "Active Entry", color = color.rgb(255, 255, 255), style = plot.style_linebr, linewidth = 2)
+plot(stopPlot, "Active Stop Loss", color = color.rgb(215, 55, 55), style = plot.style_linebr, linewidth = 2)
+plot(targetPlot, "Active Take Profit", color = color.rgb(0, 170, 95), style = plot.style_linebr, linewidth = 2)
+
+plotshape(longSignal and longAPlus, title = "A+ Long Entry", style = shape.triangleup, location = location.belowbar, color = color.rgb(0, 170, 95), size = size.small, text = "A+ L")
+plotshape(longSignal and not longAPlus, title = "B Long Entry", style = shape.triangleup, location = location.belowbar, color = color.rgb(95, 175, 255), size = size.small, text = "B L")
+plotshape(shortSignal and shortAPlus, title = "A+ Short Entry", style = shape.triangledown, location = location.abovebar, color = color.rgb(215, 55, 55), size = size.small, text = "A+ S")
+plotshape(shortSignal and not shortAPlus, title = "B Short Entry", style = shape.triangledown, location = location.abovebar, color = color.rgb(255, 160, 80), size = size.small, text = "B S")
+
+if showLabels and longSignal
+    label.new(bar_index, low, signalGrade + " LONG\nEntry " + str.tostring(longEntry, format.mintick) + "\nStop " + str.tostring(longStop, format.mintick) + "\nTP " + str.tostring(longTarget, format.mintick) + "\nQty " + str.tostring(longQty) + "\nRSI " + str.tostring(rsi14, "#.0") + "\nStretch " + str.tostring(vwapStretchAtr, "#.00") + " ATR", style = label.style_label_up, color = longAPlus ? color.rgb(0, 130, 80) : color.rgb(45, 115, 180), textcolor = color.white, size = size.small)
+
+if showLabels and shortSignal
+    label.new(bar_index, high, signalGrade + " SHORT\nEntry " + str.tostring(shortEntry, format.mintick) + "\nStop " + str.tostring(shortStop, format.mintick) + "\nTP " + str.tostring(shortTarget, format.mintick) + "\nQty " + str.tostring(shortQty) + "\nRSI " + str.tostring(rsi14, "#.0") + "\nStretch " + str.tostring(vwapStretchAtr, "#.00") + " ATR", style = label.style_label_down, color = shortAPlus ? color.rgb(180, 45, 45) : color.rgb(190, 105, 45), textcolor = color.white, size = size.small)
+
+bgcolor(showBackground and blockStrongTrend and strongBullTrend ? color.new(color.green, 92) : na)
+bgcolor(showBackground and blockStrongTrend and strongBearTrend ? color.new(color.red, 92) : na)
+bgcolor(showBackground and blockFlatVwap and flatVwapChop ? color.new(color.gray, 90) : na)
+
+var table readout = table.new(position.top_right, 2, 17, border_width = 1)
+if showDashboard and barstate.islast
+    closedTrades = strategy.closedtrades
+    winRate = closedTrades > 0 ? strategy.wintrades / closedTrades * 100.0 : na
+    profitFactor = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+    table.cell(readout, 0, 0, "VWAP MR Pro", text_color = color.white, bgcolor = color.rgb(35, 35, 35))
+    table.cell(readout, 1, 0, preset, text_color = color.white, bgcolor = color.rgb(35, 35, 35))
+    table.cell(readout, 0, 1, "Stretch")
+    table.cell(readout, 1, 1, str.tostring(vwapStretchAtr, "#.00") + " ATR")
+    table.cell(readout, 0, 2, "RSI 14")
+    table.cell(readout, 1, 2, str.tostring(rsi14, "#.0"))
+    table.cell(readout, 0, 3, "ATR 14")
+    table.cell(readout, 1, 3, str.tostring(atr14, format.mintick))
+    table.cell(readout, 0, 4, "Position")
+    table.cell(readout, 1, 4, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "Flat")
+    table.cell(readout, 0, 5, "Signal")
+    table.cell(readout, 1, 5, longSignal ? signalGrade + " LONG" : shortSignal ? signalGrade + " SHORT" : "None")
+    table.cell(readout, 0, 6, "Trend")
+    table.cell(readout, 1, 6, strongBullTrend ? "Strong Bull" : strongBearTrend ? "Strong Bear" : "Normal")
+    table.cell(readout, 0, 7, "Chop")
+    table.cell(readout, 1, 7, flatVwapChop ? "Blocked" : "OK")
+    table.cell(readout, 0, 8, "Day Signals")
+    table.cell(readout, 1, 8, str.tostring(daySignals) + "/" + str.tostring(maxSignalsPerDay))
+    table.cell(readout, 0, 9, "Day Losses")
+    table.cell(readout, 1, 9, str.tostring(dayLosses) + "/" + str.tostring(maxLossesPerDay))
+    table.cell(readout, 0, 10, "Risk/Trade")
+    table.cell(readout, 1, 10, "$" + str.tostring(accountRiskDollars, "#"))
+    table.cell(readout, 0, 11, "Net Profit")
+    table.cell(readout, 1, 11, "$" + str.tostring(strategy.netprofit, "#.00"))
+    table.cell(readout, 0, 12, "Closed Trades")
+    table.cell(readout, 1, 12, str.tostring(closedTrades))
+    table.cell(readout, 0, 13, "Win Rate")
+    table.cell(readout, 1, 13, na(winRate) ? "n/a" : str.tostring(winRate, "#.00") + "%")
+    table.cell(readout, 0, 14, "Profit Factor")
+    table.cell(readout, 1, 14, na(profitFactor) ? "n/a" : str.tostring(profitFactor, "#.00"))
+    table.cell(readout, 0, 15, "Max DD")
+    table.cell(readout, 1, 15, "$" + str.tostring(strategy.max_drawdown, "#.00"))
+    table.cell(readout, 0, 16, "Active Grade")
+    table.cell(readout, 1, 16, strategy.position_size != 0 ? activeGrade : "None")
+
+alertcondition(longSignal and longAPlus, title = "MNQ VWAP MR Pro A+ Long", message = "MNQ VWAP MR Pro A+ LONG. Check chart for entry, stop, take profit, quantity, RSI, and VWAP stretch.")
+alertcondition(longSignal and not longAPlus, title = "MNQ VWAP MR Pro B Long", message = "MNQ VWAP MR Pro B LONG. Check chart for entry, stop, take profit, quantity, RSI, and VWAP stretch.")
+alertcondition(shortSignal and shortAPlus, title = "MNQ VWAP MR Pro A+ Short", message = "MNQ VWAP MR Pro A+ SHORT. Check chart for entry, stop, take profit, quantity, RSI, and VWAP stretch.")
+alertcondition(shortSignal and not shortAPlus, title = "MNQ VWAP MR Pro B Short", message = "MNQ VWAP MR Pro B SHORT. Check chart for entry, stop, take profit, quantity, RSI, and VWAP stretch.")
